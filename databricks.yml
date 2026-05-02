@@ -60,7 +60,7 @@ resources:
               max_workers: 4
             spark_conf:
               # Estado do stream — persiste entre execuções
-              spark.sql.streaming.checkpointLocation: "/dbfs/tmp/crypto_pipeline/checkpoint"
+              spark.sql.streaming.checkpointLocation: "/Volumes/workspace/default/crypto_pipeline/checkpoint"
               # Compactação automática de arquivos Delta pequenos
               spark.databricks.delta.autoCompact.enabled: "true"
               # Otimização de leitura Delta
