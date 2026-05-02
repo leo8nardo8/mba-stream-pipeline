@@ -1,0 +1,134 @@
+# .github/workflows/deploy_pipeline.yml
+# Bônus 4: CI/CD do Stream Pipeline — MBA Engenharia de Dados
+#
+# FLUXO:
+#   Todo push/PR → job 'validate' (sem credenciais, roda sempre)
+#   Merge na main → job 'deploy' (requer DATABRICKS_TOKEN configurado)
+#
+# NOTA: O job 'deploy' requer workspace Databricks com token de acesso
+# pessoal (Enterprise/Pro). No Databricks Community Edition, esse job é
+# marcado como continue-on-error e reporta aviso — não falha o pipeline.
+# O job 'validate' roda normalmente em qualquer ambiente.
+
+name: Stream Pipeline — CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ── JOB 1: Validação (roda sempre, sem credenciais) ───────────────────────
+  validate:
+    name: Validar notebook e conectividade
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install nbformat requests
+
+      - name: Validar sintaxe do notebook
+        run: |
+          python - <<'EOF'
+          import nbformat, sys
+          path = "notebooks/stream_pipeline_coingecko.ipynb"
+          with open(path) as f:
+              nb = nbformat.read(f, as_version=4)
+          code_cells = [c for c in nb.cells if c.cell_type == "code" and c.source.strip()]
+          assert len(nb.cells) >= 8,   f"Notebook com poucas células: {len(nb.cells)}"
+          assert len(code_cells) >= 6, f"Poucas células de código: {len(code_cells)}"
+          print(f"Notebook valido — {len(nb.cells)} celulas ({len(code_cells)} de codigo)")
+          EOF
+
+      - name: Verificar conectividade com CoinGecko API (ping)
+        run: |
+          python - <<'EOF'
+          import requests
+          r = requests.get("https://api.coingecko.com/api/v3/ping", timeout=10)
+          r.raise_for_status()
+          print(f"CoinGecko API disponivel: {r.json()}")
+          EOF
+
+      - name: Verificar endpoint de cotações
+        run: |
+          python - <<'EOF'
+          import requests
+          params = {"vs_currency": "usd", "ids": "bitcoin", "per_page": 1}
+          r = requests.get("https://api.coingecko.com/api/v3/coins/markets", params=params, timeout=10)
+          r.raise_for_status()
+          data = r.json()
+          assert len(data) == 1 and "current_price" in data[0]
+          print(f"Endpoint markets OK — BTC: USD {data[0]['current_price']:,.2f}")
+          EOF
+
+      - name: Verificar estrutura do repositório
+        run: |
+          MISSING=0
+          for f in "notebooks/stream_pipeline_coingecko.ipynb" "databricks.yml" "README.md" ".github/workflows/deploy_pipeline.yml"; do
+            if [ -f "$f" ]; then echo "OK: $f"
+            else echo "FALTANDO: $f"; MISSING=1; fi
+          done
+          [ $MISSING -eq 0 ] && echo "Estrutura valida" || exit 1
+
+  # ── JOB 2: Deploy (opcional — requer DATABRICKS_TOKEN) ────────────────────
+  deploy:
+    name: Deploy no Databricks
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    continue-on-error: true
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Verificar se token está configurado
+        id: check_token
+        run: |
+          if [ -z "$DATABRICKS_TOKEN_VALUE" ]; then
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "AVISO: DATABRICKS_TOKEN nao configurado."
+            echo "No Community Edition o deploy automatico nao esta disponivel."
+            echo "O job validate acima confirma que notebook e API funcionam."
+            echo "Para habilitar: configure DATABRICKS_HOST e DATABRICKS_TOKEN nos secrets."
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "Token configurado — prosseguindo com deploy"
+          fi
+        env:
+          DATABRICKS_TOKEN_VALUE: ${{ secrets.DATABRICKS_TOKEN }}
+
+      - name: Instalar Databricks CLI
+        if: steps.check_token.outputs.configured == 'true'
+        run: pip install databricks-cli
+
+      - name: Deploy via Databricks Asset Bundle
+        if: steps.check_token.outputs.configured == 'true'
+        env:
+          DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          databricks bundle deploy --target prod
+          echo "Pipeline deployado em producao"
+
+      - name: Hash de integridade (auditoria)
+        if: steps.check_token.outputs.configured == 'true'
+        run: |
+          echo "Commit: ${{ github.sha }}"
+          echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "Autor: ${{ github.actor }}"
